@@ -19,6 +19,7 @@ import (
 
 var awsAuthorizationCredentialRegexp = regexp.MustCompile("Credential=([a-zA-Z0-9]+)/[0-9]+/([a-z]+-?[a-z]+-?[0-9]+)/s3/aws4_request")
 var awsAuthorizationSignedHeadersRegexp = regexp.MustCompile("SignedHeaders=([a-zA-Z0-9;-]+)")
+var awsAuthorizationSignatureRegexp = regexp.MustCompile("Signature=([a-zA-Z0-9]+)")
 
 // Handler is a special handler that re-signs any AWS S3 request and sends it upstream
 type Handler struct {
@@ -81,6 +82,12 @@ func (h *Handler) signWithTime(signer *v4.Signer, req *http.Request, region stri
 	}
 
 	_, err := signer.Sign(req, body, "s3", region, signTime)
+	return err
+}
+
+func (h *Handler) presignWithTime(signer *v4.Signer, req *http.Request, region string, exp time.Duration, signTime time.Time) error {
+	signer.DisableHeaderHoisting = true
+	_, err := signer.Presign(req, nil, "s3", region, exp, signTime)
 	return err
 }
 
@@ -161,9 +168,23 @@ func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Reque
 		return nil, fmt.Errorf("error parsing X-Amz-Date %v - %v", req.Header["X-Amz-Date"][0], err)
 	}
 
-	// Sign the fake request with the original timestamp
-	if err := h.signWithTime(signer, fakeReq, region, signTime); err != nil {
-		return nil, err
+	if expHeader, ok := req.Header["X-Amz-Expires"]; ok {
+		// The X-Amz-Expires header contains an integer duration, such as: 3600
+		// Presence of this header indicates that this is a pre-signed url
+		exp, err := time.ParseDuration(expHeader[0] + "s")
+		if err != nil {
+			return nil, fmt.Errorf("error parsing X-Amz-Expires %v - %v", expHeader[0], err)
+		}
+
+		// Pre-sign the fake request with the original timestamp
+		if err := h.presignWithTime(signer, fakeReq, region, exp, signTime); err != nil {
+			return nil, err
+		}
+	} else {
+		// Sign the fake request with the original timestamp
+		if err := h.signWithTime(signer, fakeReq, region, signTime); err != nil {
+			return nil, err
+		}
 	}
 
 	return fakeReq, nil
@@ -199,7 +220,24 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	// Add origin headers after request is signed (no overwrite)
 	copyHeaderWithoutOverwrite(proxyReq.Header, req.Header)
 
+	// drop expiration header from pre-signed urls
+	proxyReq.Header.Del("x-amz-expires")
+
 	return proxyReq, nil
+}
+
+func findSignatureInRequest(req *http.Request) (string, error) {
+	if authHeader, ok := req.Header["Authorization"]; ok {
+		// Extract signature from Authorization header
+		match := awsAuthorizationSignatureRegexp.FindStringSubmatch(authHeader[0])
+		if len(match) == 2 {
+			return match[1], nil
+		}
+	} else if signatureParam, ok := req.URL.Query()["X-Amz-Signature"]; ok {
+		// Signature in query params
+		return signatureParam[0], nil
+	}
+	return "", fmt.Errorf("unable to find signature in request")
 }
 
 // Do validates the incoming request and create a new request for an upstream server
@@ -225,9 +263,19 @@ func (h *Handler) buildUpstreamRequest(req *http.Request) (*http.Request, error)
 		return nil, err
 	}
 
+	fakeSig, err := findSignatureInRequest(fakeReq)
+	if err != nil {
+		return nil, err
+	}
+
+	realSig, err := findSignatureInRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify that the fake request and the incoming request have the same signature
 	// This ensures it was sent and signed by a client with correct AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-	cmpResult := subtle.ConstantTimeCompare([]byte(fakeReq.Header["Authorization"][0]), []byte(req.Header["Authorization"][0]))
+	cmpResult := subtle.ConstantTimeCompare([]byte(fakeSig), []byte(realSig))
 	if cmpResult == 0 {
 		v, _ := httputil.DumpRequest(fakeReq, false)
 		log.Debugf("Fake request: %v", string(v))
