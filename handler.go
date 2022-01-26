@@ -20,6 +20,7 @@ import (
 var awsAuthorizationCredentialRegexp = regexp.MustCompile("Credential=([a-zA-Z0-9]+)/[0-9]+/([a-z]+-?[a-z]+-?[0-9]+)/s3/aws4_request")
 var awsAuthorizationSignedHeadersRegexp = regexp.MustCompile("SignedHeaders=([a-zA-Z0-9;-]+)")
 var awsAuthorizationSignatureRegexp = regexp.MustCompile("Signature=([a-zA-Z0-9]+)")
+var awsAmzCredentialQueryParamRegexp = regexp.MustCompile("([a-zA-Z0-9]+)/[0-9]+/([a-z]+-?[a-z]+-?[0-9]+)/s3/aws4_request")
 
 // Handler is a special handler that re-signs any AWS S3 request and sends it upstream
 type Handler struct {
@@ -86,7 +87,6 @@ func (h *Handler) signWithTime(signer *v4.Signer, req *http.Request, region stri
 }
 
 func (h *Handler) presignWithTime(signer *v4.Signer, req *http.Request, region string, exp time.Duration, signTime time.Time) error {
-	signer.DisableHeaderHoisting = true
 	_, err := signer.Presign(req, nil, "s3", region, exp, signTime)
 	return err
 }
@@ -116,22 +116,38 @@ func (h *Handler) validateIncomingSourceIP(req *http.Request) error {
 	return nil
 }
 
-func (h *Handler) validateIncomingHeaders(req *http.Request) (string, string, error) {
-	amzDateHeader := req.Header["X-Amz-Date"]
-	if len(amzDateHeader) != 1 {
-		return "", "", fmt.Errorf("X-Amz-Date header missing or set multiple times: %v", req)
+func (h *Handler) validateIncomingRequestParameters(req *http.Request) (string, string, error) {
+	_, err := h.findInHeaderOrQueryParam(req, "X-Amz-Date")
+	if err != nil {
+		return "", "", err
 	}
 
-	authorizationHeader := req.Header["Authorization"]
-	if len(authorizationHeader) != 1 {
-		return "", "", fmt.Errorf("Authorization header missing or set multiple times: %v", req)
+	var receivedAccessKeyID string
+	var region string
+
+	if authorizationHeader, ok := req.Header["Authorization"]; ok {
+		if len(authorizationHeader) > 1 {
+			return "", "", fmt.Errorf("Authorization header set multiple times: %v", req)
+		}
+		match := awsAuthorizationCredentialRegexp.FindStringSubmatch(authorizationHeader[0])
+		if len(match) != 3 {
+			return "", "", fmt.Errorf("invalid Authorization header: Credential not found: %v", req)
+		}
+		receivedAccessKeyID = match[1]
+		region = match[2]
+	} else if credentialParam, ok := req.URL.Query()["X-Amz-Credential"]; ok {
+		if len(credentialParam) != 1 {
+			return "", "", fmt.Errorf("X-Amz-Credential query parameter set multiple times: %v", req)
+		}
+		match := awsAmzCredentialQueryParamRegexp.FindStringSubmatch(credentialParam[0])
+		if len(match) != 3 {
+			return "", "", fmt.Errorf("invalid X-Amz-Credential query parameter: Credential not found: %v", req)
+		}
+		receivedAccessKeyID = match[1]
+		region = match[2]
+	} else {
+		return "", "", fmt.Errorf("X-Amz-Credential query parameter or Authorization header missing: %v", req)
 	}
-	match := awsAuthorizationCredentialRegexp.FindStringSubmatch(authorizationHeader[0])
-	if len(match) != 3 {
-		return "", "", fmt.Errorf("invalid Authorization header: Credential not found: %v", req)
-	}
-	receivedAccessKeyID := match[1]
-	region := match[2]
 
 	// Validate the received Credential (ACCESS_KEY_ID) is allowed
 	for accessKeyID := range h.AWSCredentials {
@@ -149,6 +165,11 @@ func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Reque
 	}
 	fakeReq.URL.RawPath = req.URL.Path
 
+	// Remove existing signature to avoid presigner ignoring the time
+	q := fakeReq.URL.Query()
+	q.Del("X-Amz-Signature")
+	fakeReq.URL.RawQuery = q.Encode()
+
 	// We already validated there there is exactly one Authorization header
 	authorizationHeader := req.Header.Get("authorization")
 	match := awsAuthorizationSignedHeadersRegexp.FindStringSubmatch(authorizationHeader)
@@ -162,20 +183,25 @@ func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Reque
 	fakeReq.Header.Del("host")
 	fakeReq.Host = h.AllowedSourceEndpoint
 
-	// The X-Amz-Date header contains a timestamp, such as: 20190929T182805Z
-	signTime, err := time.Parse("20060102T150405Z", req.Header["X-Amz-Date"][0])
+	// The X-Amz-Date contains a timestamp, such as: 20190929T182805Z
+	xAmzDate, err := h.findInHeaderOrQueryParam(req, "X-Amz-Date")
 	if err != nil {
-		return nil, fmt.Errorf("error parsing X-Amz-Date %v - %v", req.Header["X-Amz-Date"][0], err)
+		return nil, err
+	}
+	signTime, err := time.Parse("20060102T150405Z", xAmzDate)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing X-Amz-Date %v - %v", xAmzDate, err)
 	}
 
-	if expHeader, ok := req.Header["X-Amz-Expires"]; ok {
-		// The X-Amz-Expires header contains an integer duration, such as: 3600
+	// The X-Amz-Expires contains an integer duration, such as: 3600
+	xAmzExpires, err := h.findInHeaderOrQueryParam(req, "X-Amz-Expires")
+	log.Debugf("xAmzExpires: %v", xAmzExpires)
+	if err == nil {
 		// Presence of this header indicates that this is a pre-signed url
-		exp, err := time.ParseDuration(expHeader[0] + "s")
+		exp, err := time.ParseDuration(xAmzExpires + "s")
 		if err != nil {
-			return nil, fmt.Errorf("error parsing X-Amz-Expires %v - %v", expHeader[0], err)
+			return nil, fmt.Errorf("error parsing X-Amz-Expires %v - %v", xAmzExpires, err)
 		}
-
 		// Pre-sign the fake request with the original timestamp
 		if err := h.presignWithTime(signer, fakeReq, region, exp, signTime); err != nil {
 			return nil, err
@@ -212,6 +238,15 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 		proxyReq.Header["Content-Md5"] = val
 	}
 
+	// Strip any existing authorization query parameters
+	q := proxyReq.URL.Query()
+	q.Del("X-Amz-Algorithm")
+	q.Del("X-Amz-Credential")
+	q.Del("X-Amz-Date")
+	q.Del("X-Amz-Expires")
+	q.Del("X-Amz-Signature")
+	proxyReq.URL.RawQuery = q.Encode()
+
 	// Sign the upstream request
 	if err := h.sign(signer, proxyReq, region); err != nil {
 		return nil, err
@@ -226,7 +261,25 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	return proxyReq, nil
 }
 
-func findSignatureInRequest(req *http.Request) (string, error) {
+func (h *Handler) findInHeaderOrQueryParam(req *http.Request, key string) (string, error) {
+	var value string
+	if header, ok := req.Header[key]; ok {
+		if len(header) > 1 {
+			return "", fmt.Errorf("%v header set multiple times: %v", key, req)
+		}
+		value = header[0]
+	} else if param, ok := req.URL.Query()[key]; ok {
+		if len(param) != 1 {
+			return "", fmt.Errorf("%v query parameter set multiple times: %v", key, req)
+		}
+		value = param[0]
+	} else {
+		return "", fmt.Errorf("%v query parameter or header missing: %v", key, req)
+	}
+	return value, nil
+}
+
+func (h *Handler) findSignatureInRequest(req *http.Request) (string, error) {
 	if authHeader, ok := req.Header["Authorization"]; ok {
 		// Extract signature from Authorization header
 		match := awsAuthorizationSignatureRegexp.FindStringSubmatch(authHeader[0])
@@ -249,7 +302,7 @@ func (h *Handler) buildUpstreamRequest(req *http.Request) (*http.Request, error)
 	}
 
 	// Validate incoming headers and extract AWS_ACCESS_KEY_ID
-	accessKeyID, region, err := h.validateIncomingHeaders(req)
+	accessKeyID, region, err := h.validateIncomingRequestParameters(req)
 	if err != nil {
 		return nil, err
 	}
@@ -263,12 +316,12 @@ func (h *Handler) buildUpstreamRequest(req *http.Request) (*http.Request, error)
 		return nil, err
 	}
 
-	fakeSig, err := findSignatureInRequest(fakeReq)
+	fakeSig, err := h.findSignatureInRequest(fakeReq)
 	if err != nil {
 		return nil, err
 	}
 
-	realSig, err := findSignatureInRequest(req)
+	realSig, err := h.findSignatureInRequest(req)
 	if err != nil {
 		return nil, err
 	}
