@@ -50,6 +50,12 @@ type Handler struct {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	isHealthCheck := h.serveHealthCheck(w, r)
+	if isHealthCheck == true {
+		log.Debug("Served health check")
+		return
+	}
+
 	proxyReq, err := h.buildUpstreamRequest(r)
 	if err != nil {
 		log.WithError(err).Error("unable to proxy request")
@@ -66,6 +72,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy := httputil.NewSingleHostReverseProxy(&url)
 	proxy.FlushInterval = 1
 	proxy.ServeHTTP(w, proxyReq)
+}
+
+func (H *Handler) serveHealthCheck(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/check" {
+		return false
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("UP\n"))
+	return true
 }
 
 func (h *Handler) sign(signer *v4.Signer, req *http.Request, region string) error {
