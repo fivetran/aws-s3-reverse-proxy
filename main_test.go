@@ -12,6 +12,7 @@ func TestParseOptions(t *testing.T) {
 		AllowedSourceSubnet:   []string{"127.0.0.1/32", "192.168.1.0/24"},
 		AwsCredentials:        []string{"fooooooooooooooo,bar", "baaaaaaaaaaaaaar,baz"},
 		Region:                "eu-test-1",
+		LogFormat:             "json",
 	})
 	assert.Nil(t, err)
 	assert.Equal(t, "https", h.UpstreamScheme)

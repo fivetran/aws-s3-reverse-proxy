@@ -30,6 +30,7 @@ type Options struct {
 	UpstreamEndpoint      string
 	CertFile              string
 	KeyFile               string
+	LogFormat             string
 }
 
 // NewOptions defines and parses the raw command line arguments
@@ -47,6 +48,8 @@ func NewOptions() Options {
 	kingpin.Flag("upstream-endpoint", "use this S3 endpoint for upstream connections, instead of public AWS S3 (env - UPSTREAM_ENDPOINT)").Envar("UPSTREAM_ENDPOINT").StringVar(&opts.UpstreamEndpoint)
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
+	kingpin.Flag("log-format", "output format of logs, either text (default) or json (env - LOG_FORMAT)").Envar("LOG_FORMAT").Default("text").EnumVar(&opts.LogFormat, "text", "json")
+
 	kingpin.Parse()
 	return opts
 }
@@ -57,6 +60,11 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 	if opts.Debug {
 		log.SetLevel(log.DebugLevel)
 	}
+  // text is the default format for sirupsen/logrus
+  // and requires no explicit SetFormatter() call
+  if opts.LogFormat == "json" {
+    log.SetFormatter(&log.JSONFormatter{})
+  }
 
 	scheme := "https"
 	if opts.UpstreamInsecure {
