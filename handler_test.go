@@ -95,7 +95,7 @@ func TestHandlerMissingAmzDate(t *testing.T) {
 	resp := httptest.NewRecorder()
 	h.ServeHTTP(resp, req)
 	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "X-Amz-Date header missing or set multiple times")
+	assert.Contains(t, resp.Body.String(), "X-Amz-Date query parameter or header missing")
 }
 
 func TestHandlerMissingAuthorization(t *testing.T) {
@@ -106,7 +106,7 @@ func TestHandlerMissingAuthorization(t *testing.T) {
 	resp := httptest.NewRecorder()
 	h.ServeHTTP(resp, req)
 	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "Authorization header missing or set multiple times")
+	assert.Contains(t, resp.Body.String(), "X-Amz-Credential query parameter or Authorization header missing")
 }
 
 func TestHandlerMissingCredential(t *testing.T) {
